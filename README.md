@@ -1,69 +1,8 @@
-此为项目来自 https://linux.do 
-
-# Ds5Plus
-
-Wireless DualSense audio-reactive haptics driver for macOS over Bluetooth HID.
-
-## Overview
-
-Ds5Plus is a macOS app that drives **DualSense / DualSense Edge haptics wirelessly over Bluetooth HID** and maps **system audio** into controller vibration and dynamic lightbar feedback.
-
-It is designed for games that do not expose native wireless DualSense haptics on macOS, while still keeping the experience lightweight, responsive, and customizable.
-
-## Features
-
-- Bluetooth HID direct drive for DualSense on macOS
-- Audio-reactive haptics from system audio capture
-- Game-tuned built-in presets, including:
-  - Silksong
-  - TUNIC
-- Custom user presets
-- Dynamic lightbar tint with preset colors and custom color editor
-- Controller battery display
-- Lightweight logging and adjustable log size limit
-- Chinese / English interface switching
-
-## Requirements
-
-- macOS with Bluetooth support
-- A paired **DualSense** or **DualSense Edge**
-- Screen Recording permission for system audio capture
-- Xcode 16+ recommended for building
-
-## Build
-
-Open the project in Xcode:
-
-`/Users/pengyu/Downloads/Ds5plus/Ds5plus.xcodeproj`
-
-Or build from Terminal:
-
-```bash
-xcodebuild \
-  -project /Users/pengyu/Downloads/Ds5plus/Ds5plus.xcodeproj \
-  -scheme Ds5plus \
-  -configuration Debug \
-  -derivedDataPath /Users/pengyu/Downloads/Ds5plus/build \
-  CODE_SIGNING_ALLOWED=NO build
-```
-
-Built app path:
-
-`/Users/pengyu/Downloads/Ds5plus/build/Ds5plus.app`
-
-## Notes
-
-- This project focuses on **wireless Bluetooth-only DualSense haptics**
-- Wired USB haptics are not the target path here
-- Audio-driven vibration is tuned to suppress background music as much as possible while preserving effects, movement, attacks, and impacts
-
-## License
-
-Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+此为项目来自社区 [linux.do](https://linux.do)
 
 ---
 
-# Ds5Plus（中文）
+# Ds5Plus
 
 通过蓝牙 HID 在 macOS 上实现 DualSense 无线音频驱动震动。
 
@@ -115,10 +54,11 @@ xcodebuild \
 `/Users/pengyu/Downloads/Ds5plus/build/Ds5plus.app`
 
 ## 说明
-
-- 本项目聚焦于 **无线蓝牙 DualSense 震动**
-- 不以有线 USB 路线为目标
-- 音频震动逻辑会尽量压制背景音乐，只保留更有体感价值的环境音、步态、攻击、受击与瞬态事件
+ - 基于音频解析实现的无线的Ds5震动
+ - 震动预设的个性化调整
+ - 显示Ds5手柄电量（使用时为黄色、充电时为绿色、电量低于20%时为红色）
+ - 对手柄灯条的颜色的色相、饱和度、亮度提供现有选项和自定义功能
+ - 针对空洞骑士：丝之歌、tunic 这两款游戏做了特殊优化过的现成预设
 
 ## 许可证
 
