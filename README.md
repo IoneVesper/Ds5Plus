@@ -1,3 +1,5 @@
+此为项目来自 https://linux.do 
+
 # Ds5Plus
 
 Wireless DualSense audio-reactive haptics driver for macOS over Bluetooth HID.
