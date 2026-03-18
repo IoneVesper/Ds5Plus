@@ -53,13 +53,6 @@ xcodebuild \
 
 `/Users/pengyu/Downloads/Ds5plus/build/Ds5plus.app`
 
-## 说明
- - 基于音频解析实现的无线的Ds5震动
- - 震动预设的个性化调整
- - 显示Ds5手柄电量（使用时为黄色、充电时为绿色、电量低于20%时为红色）
- - 对手柄灯条的颜色的色相、饱和度、亮度提供现有选项和自定义功能
- - 针对空洞骑士：丝之歌、tunic 这两款游戏做了特殊优化过的现成预设
-
 ## 许可证
 
 本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）**。
