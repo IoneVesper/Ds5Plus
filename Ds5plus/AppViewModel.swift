@@ -5,12 +5,14 @@ import QuartzCore
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    private let shouldBootstrapServices: Bool
+
     @Published var devices: [DualSenseDeviceInfo] = []
     @Published var selectedDeviceID: String? {
         didSet {
             guard selectedDeviceID != oldValue else { return }
             batteryStatus = ControllerBatteryStatus()
-            if let selectedDeviceID {
+            if shouldBootstrapServices, let selectedDeviceID {
                 hidService.refreshBatteryStatus(deviceID: selectedDeviceID)
             }
         }
@@ -35,15 +37,18 @@ final class AppViewModel: ObservableObject {
     @Published var batteryStatus = ControllerBatteryStatus()
 
     @Published var isRunning = false
+    @Published private(set) var isStarting = false
     @Published var statusLine = "等待蓝牙 DualSense"
     @Published var stats = DriverStats()
-    @Published private(set) var logFileURL = AppViewModel.prepareLogFile()
+    @Published private(set) var logFileURL: URL
     @Published private(set) var logFileSizeBytes: Int64 = 0
 
-    private let hidService = DualSenseHIDService()
-    private let audioEngine = SystemAudioHapticsEngine()
-    private let userDefaults = UserDefaults.standard
+    private let hidService: DualSenseHIDService
+    private let audioEngine: SystemAudioHapticsEngine
+    private let userDefaults: UserDefaults
 
+    private var audioStartTask: Task<Void, Never>?
+    private var runGeneration = 0
     private var previousMovementSignal: Float = 0
     private var previousImpactSignal: Float = 0
     private var suppressionMemory: Float = 0
@@ -66,95 +71,110 @@ final class AppViewModel: ObservableObject {
         static let logFileSizeMB = "Ds5plus.logFileSizeMB"
     }
 
-    init() {
-        loadPersistedSettings()
+    init(
+        hidService: DualSenseHIDService? = nil,
+        audioEngine: SystemAudioHapticsEngine? = nil,
+        userDefaults: UserDefaults = .standard,
+        autoBootstrap: Bool = true
+    ) {
+        shouldBootstrapServices = autoBootstrap
+        self.hidService = hidService ?? DualSenseHIDService(startMonitoring: autoBootstrap)
+        self.audioEngine = audioEngine ?? SystemAudioHapticsEngine()
+        self.userDefaults = userDefaults
+        logFileURL = autoBootstrap ? AppViewModel.prepareLogFile() : AppViewModel.previewLogFileURL()
 
-        hidService.onDevicesChanged = { [weak self] devices in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let previousSelectedDeviceID = self.selectedDeviceID
-                self.devices = devices
+        if autoBootstrap {
+            loadPersistedSettings()
+        }
 
-                if let selectedDeviceID = self.selectedDeviceID,
-                   devices.contains(where: { $0.id == selectedDeviceID }) {
-                    return
+        if autoBootstrap {
+            self.hidService.onDevicesChanged = { [weak self] devices in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    let previousSelectedDeviceID = self.selectedDeviceID
+                    self.devices = devices
+
+                    if let selectedDeviceID = self.selectedDeviceID,
+                       devices.contains(where: { $0.id == selectedDeviceID }) {
+                        return
+                    }
+
+                    self.selectedDeviceID = devices.first?.id
+                    self.batteryStatus = ControllerBatteryStatus()
+                    self.statusLine = devices.isEmpty ? "未发现蓝牙 DualSense" : "已连接蓝牙 DualSense"
+
+                    if self.isRunning || self.isStarting,
+                       let previousSelectedDeviceID,
+                       !devices.contains(where: { $0.id == previousSelectedDeviceID }) {
+                        self.stopAudioReactive(
+                            statusLine: "DualSense 已断开",
+                            logLine: "当前运行中的 DualSense 已断开，已自动停止输出。"
+                        )
+                    }
                 }
+            }
 
-                self.selectedDeviceID = devices.first?.id
-                self.batteryStatus = ControllerBatteryStatus()
-                self.statusLine = devices.isEmpty ? "未发现蓝牙 DualSense" : "已连接蓝牙 DualSense"
-
-                if self.isRunning,
-                   let previousSelectedDeviceID,
-                   !devices.contains(where: { $0.id == previousSelectedDeviceID }) {
-                    self.audioEngine.stop()
-                    self.hidService.stopEffect()
-                    self.resetHapticMixer()
-                    self.isRunning = false
-                    self.statusLine = "DualSense 已断开"
-                    self.appendLog("当前运行中的 DualSense 已断开，已自动停止输出。")
+            self.hidService.onLog = { [weak self] line in
+                DispatchQueue.main.async {
+                    self?.appendLog(line)
                 }
             }
-        }
 
-        hidService.onLog = { [weak self] line in
-            DispatchQueue.main.async {
-                self?.appendLog(line)
+            self.hidService.onStatsChanged = { [weak self] stats in
+                DispatchQueue.main.async {
+                    self?.stats = stats
+                }
             }
-        }
 
-        hidService.onStatsChanged = { [weak self] stats in
-            DispatchQueue.main.async {
-                self?.stats = stats
+            self.hidService.onBatteryChanged = { [weak self] deviceID, status in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard self.selectedDeviceID == deviceID else { return }
+                    guard self.batteryStatus != status else { return }
+                    self.batteryStatus = status
+                }
             }
-        }
 
-        hidService.onBatteryChanged = { [weak self] deviceID, status in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard self.selectedDeviceID == deviceID else { return }
-                guard self.batteryStatus != status else { return }
-                self.batteryStatus = status
+            self.audioEngine.onLog = { [weak self] line in
+                DispatchQueue.main.async {
+                    self?.appendLog(line)
+                }
             }
-        }
 
-        audioEngine.onLog = { [weak self] line in
-            DispatchQueue.main.async {
-                self?.appendLog(line)
+            self.audioEngine.onSample = { [weak self] sample in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.audioSample = sample
+                    guard self.isRunning else { return }
+                    let motors = self.mapAudioSampleToMotors(sample)
+                    let color = self.mapAudioSampleToLightbar(sample)
+                    self.hidService.sendRealtimeHaptics(leftMotor: motors.left, rightMotor: motors.right, lightbar: color)
+                }
             }
-        }
 
-        audioEngine.onSample = { [weak self] sample in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.audioSample = sample
-                guard self.isRunning else { return }
-                let motors = self.mapAudioSampleToMotors(sample)
-                let color = self.mapAudioSampleToLightbar(sample)
-                self.hidService.sendRealtimeHaptics(leftMotor: motors.left, rightMotor: motors.right, lightbar: color)
-            }
-        }
-
-        audioEngine.onCaptureStateChanged = { [weak self] isCapturing, reason in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard !isCapturing, self.isRunning else { return }
-                self.hidService.stopEffect()
-                self.resetHapticMixer()
-                self.isRunning = false
-                self.statusLine = "音频驱动已停止"
-                if let reason, !reason.isEmpty {
-                    self.appendLog("系统音频捕获已停止：\(reason)")
+            self.audioEngine.onCaptureStateChanged = { [weak self] isCapturing, reason in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard !isCapturing, self.isRunning || self.isStarting else { return }
+                    self.stopAudioReactive(
+                        statusLine: "音频驱动已停止",
+                        logLine: nil
+                    )
+                    if let reason, !reason.isEmpty {
+                        self.appendLog("系统音频捕获已停止：\(reason)")
+                    }
                 }
             }
         }
 
         applyAudioPreset(audioPreset, shouldLog: false)
         refreshLogFileMetadata()
-        trimLogFileIfNeeded()
-        appendLog("应用已启动。")
-        Task {
-            await refreshAll(silent: true)
+        if autoBootstrap {
+            trimLogFileIfNeeded()
+            appendLog("应用已启动。")
+            Task {
+                await refreshAll(silent: true)
+            }
         }
     }
 
@@ -162,8 +182,20 @@ final class AppViewModel: ObservableObject {
         devices.first(where: { $0.id == selectedDeviceID })
     }
 
+    var selectedDisplay: CaptureDisplay? {
+        displays.first(where: { $0.id == selectedDisplayID })
+    }
+
+    var isPreviewMode: Bool {
+        !shouldBootstrapServices
+    }
+
+    var canRefreshServices: Bool {
+        shouldBootstrapServices
+    }
+
     var canToggleRun: Bool {
-        selectedDeviceID != nil && selectedDisplayID != nil
+        shouldBootstrapServices && (isRunning || isStarting || (selectedDeviceID != nil && selectedDisplayID != nil))
     }
 
     var selectedCustomPreset: UserAudioPreset? {
@@ -180,10 +212,17 @@ final class AppViewModel: ObservableObject {
     }
 
     var captureStatusText: String {
-        captureEnabled ? "On" : "Off"
+        captureEnabled ? "可用".localized : "不可用".localized
+    }
+
+    var captureSelectionTitle: String {
+        selectedDisplay?.displayName ?? "选择捕获显示器".localized
     }
 
     var runStatusText: String {
+        if isStarting {
+            return "启动中".localized
+        }
         if isRunning {
             return stats.lastResult == "ok" ? "正常".localized : "异常".localized
         }
@@ -191,6 +230,9 @@ final class AppViewModel: ObservableObject {
     }
 
     var runStatusTint: Color {
+        if isStarting {
+            return Color(red: 0.91, green: 0.67, blue: 0.16)
+        }
         if isRunning {
             return stats.lastResult == "ok" ? Color(red: 0.20, green: 0.72, blue: 0.44) : Color(red: 0.89, green: 0.31, blue: 0.27)
         }
@@ -206,11 +248,11 @@ final class AppViewModel: ObservableObject {
     }
 
     var runButtonSymbolName: String {
-        isRunning ? "stop.fill" : "play.fill"
+        isRunning || isStarting ? "stop.fill" : "play.fill"
     }
 
     var runButtonTint: Color {
-        isRunning ? Color(red: 0.89, green: 0.32, blue: 0.27) : Color(red: 0.24, green: 0.50, blue: 0.96)
+        isRunning || isStarting ? Color(red: 0.89, green: 0.32, blue: 0.27) : Color(red: 0.24, green: 0.50, blue: 0.96)
     }
 
     var logDirectoryURL: URL {
@@ -275,6 +317,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshAll(silent: Bool = false) async {
+        guard shouldBootstrapServices else { return }
         hidService.refreshDevicesSnapshot()
         if !silent {
             appendLog("已刷新蓝牙设备。")
@@ -283,14 +326,22 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshDisplays(silent: Bool = false) async {
+        guard shouldBootstrapServices else { return }
         do {
             let displays = try await audioEngine.refreshDisplays()
             self.displays = displays
 
-            if let selectedDisplayID,
-               displays.contains(where: { $0.id == selectedDisplayID }) {
+            if let selectedDisplayID {
+                if displays.contains(where: { $0.id == selectedDisplayID }) {
+                    if !silent {
+                        appendLog("已刷新系统音频捕获源。")
+                    }
+                    return
+                }
+
+                self.selectedDisplayID = nil
                 if !silent {
-                    appendLog("已刷新系统音频捕获源。")
+                    appendLog(displays.isEmpty ? "当前没有可用的系统音频捕获源。" : "当前捕获显示器已不可用，请重新选择。")
                 }
                 return
             }
@@ -300,12 +351,14 @@ final class AppViewModel: ObservableObject {
                 appendLog(displays.isEmpty ? "当前没有可用的系统音频捕获源。" : "已刷新系统音频捕获源。")
             }
         } catch {
+            self.displays = []
+            self.selectedDisplayID = nil
             appendLog("读取系统音频捕获显示器失败：\(error.localizedDescription)")
         }
     }
 
     func toggleRunState() {
-        if isRunning {
+        if isRunning || isStarting {
             stopEffect()
         } else {
             startAudioReactive()
@@ -313,6 +366,11 @@ final class AppViewModel: ObservableObject {
     }
 
     func startAudioReactive() {
+        guard shouldBootstrapServices else {
+            statusLine = "预览模式"
+            return
+        }
+        guard !isRunning, !isStarting else { return }
         guard let selectedDeviceID else {
             appendLog("请先连接一个蓝牙 DualSense。")
             statusLine = "未发现手柄"
@@ -324,26 +382,67 @@ final class AppViewModel: ObservableObject {
             return
         }
 
+        audioStartTask?.cancel()
+        audioStartTask = nil
+        runGeneration += 1
+        let generation = runGeneration
+        let requestedDeviceID = selectedDeviceID
+        let requestedDisplayID = selectedDisplayID
+
         resetHapticMixer()
-        guard hidService.startRealtimeControl(deviceID: selectedDeviceID) else {
+        isStarting = true
+        isRunning = false
+        statusLine = "音频驱动启动中"
+
+        guard hidService.startRealtimeControl(deviceID: requestedDeviceID) else {
+            isStarting = false
             statusLine = "启动失败"
-            isRunning = false
             return
         }
 
-        Task {
+        audioStartTask = Task { [weak self] in
+            guard let self else { return }
             do {
-                try await audioEngine.start(displayID: selectedDisplayID)
+                try await audioEngine.start(displayID: requestedDisplayID)
+                try Task.checkCancellation()
                 await MainActor.run {
+                    guard self.runGeneration == generation,
+                          self.selectedDeviceID == requestedDeviceID,
+                          self.selectedDisplayID == requestedDisplayID else {
+                        self.audioStartTask = nil
+                        self.audioEngine.stop()
+                        self.hidService.stopEffect()
+                        self.resetHapticMixer()
+                        self.isStarting = false
+                        self.isRunning = false
+                        self.statusLine = "启动已取消"
+                        return
+                    }
+                    self.audioStartTask = nil
+                    self.isStarting = false
                     self.isRunning = true
                     self.statusLine = "音频驱动运行中"
                     self.appendLog("音频驱动已开始。")
                 }
-            } catch {
+            } catch is CancellationError {
                 await MainActor.run {
+                    guard self.runGeneration == generation else { return }
+                    self.audioStartTask = nil
                     self.audioEngine.stop()
                     self.hidService.stopEffect()
                     self.resetHapticMixer()
+                    self.isStarting = false
+                    self.isRunning = false
+                    self.statusLine = "音频驱动已停止"
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.runGeneration == generation else { return }
+                    self.audioStartTask = nil
+                    self.audioEngine.stop()
+                    self.hidService.stopEffect()
+                    self.resetHapticMixer()
+                    self.isStarting = false
                     self.isRunning = false
                     self.statusLine = "启动失败"
                     self.appendLog("启动音频驱动模式失败：\(error.localizedDescription)")
@@ -353,12 +452,25 @@ final class AppViewModel: ObservableObject {
     }
 
     func stopEffect() {
+        stopAudioReactive(
+            statusLine: "音频驱动已停止",
+            logLine: "音频驱动已停止。"
+        )
+    }
+
+    private func stopAudioReactive(statusLine: String, logLine: String?) {
+        runGeneration += 1
+        audioStartTask?.cancel()
+        audioStartTask = nil
         audioEngine.stop()
         hidService.stopEffect()
         resetHapticMixer()
-        statusLine = "音频驱动已停止"
+        self.statusLine = statusLine
+        isStarting = false
         isRunning = false
-        appendLog("音频驱动已停止。")
+        if let logLine {
+            appendLog(logLine)
+        }
     }
 
     func applyAudioPreset(_ preset: AudioReactivePreset, shouldLog: Bool = true) {
@@ -426,9 +538,11 @@ final class AppViewModel: ObservableObject {
     func selectLightbarColor(_ preset: LightbarColorPreset) {
         lightbarColorPreset = preset
         isCustomLightbarColorSelected = false
-        userDefaults.set(preset.rawValue, forKey: DefaultsKeys.lightbarColor)
-        userDefaults.set(false, forKey: DefaultsKeys.customLightbarSelected)
-        if let selectedDeviceID {
+        if shouldBootstrapServices {
+            userDefaults.set(preset.rawValue, forKey: DefaultsKeys.lightbarColor)
+            userDefaults.set(false, forKey: DefaultsKeys.customLightbarSelected)
+        }
+        if shouldBootstrapServices, let selectedDeviceID {
             hidService.previewLightbar(deviceID: selectedDeviceID, color: currentLightbarPreviewColor())
         }
     }
@@ -447,7 +561,7 @@ final class AppViewModel: ObservableObject {
         isCustomLightbarColorSelected = true
         persistCustomLightbarSettings()
 
-        if preview, let selectedDeviceID {
+        if shouldBootstrapServices, preview, let selectedDeviceID {
             hidService.previewLightbar(deviceID: selectedDeviceID, color: currentLightbarPreviewColor())
         }
     }
@@ -455,6 +569,7 @@ final class AppViewModel: ObservableObject {
     func updateLogFileSizeOption(_ option: LogFileSizeOption) {
         guard logFileSizeOption != option else { return }
         logFileSizeOption = option
+        guard shouldBootstrapServices else { return }
         userDefaults.set(option.rawValue, forKey: DefaultsKeys.logFileSizeMB)
         trimLogFileIfNeeded()
         appendLog("已将日志最大大小设置为 \(option.title)")
@@ -735,6 +850,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func persistCustomLightbarSettings() {
+        guard shouldBootstrapServices else { return }
         userDefaults.set(isCustomLightbarColorSelected, forKey: DefaultsKeys.customLightbarSelected)
         userDefaults.set(customLightbarHue, forKey: DefaultsKeys.customLightbarHue)
         userDefaults.set(customLightbarSaturation, forKey: DefaultsKeys.customLightbarSaturation)
@@ -742,6 +858,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func persistCustomAudioPresets() {
+        guard shouldBootstrapServices else { return }
         guard let data = try? JSONEncoder().encode(customAudioPresets) else { return }
         userDefaults.set(data, forKey: DefaultsKeys.customAudioPresets)
     }
@@ -810,5 +927,50 @@ final class AppViewModel: ObservableObject {
             fileManager.createFile(atPath: fileURL.path, contents: Data())
         }
         return fileURL
+    }
+
+    private static func previewLogFileURL() -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("Ds5plus-preview.log")
+    }
+}
+
+extension AppViewModel {
+    static var preview: AppViewModel {
+        let model = AppViewModel(autoBootstrap: false)
+
+        let previewDevice = DualSenseDeviceInfo(
+            id: "preview-dualsense",
+            name: "DualSense Wireless Controller",
+            serialNumber: "AA:BB:CC:DD:EE:FF",
+            transport: "Bluetooth",
+            productID: 0x0CE6
+        )
+        let previewDisplay = CaptureDisplay(id: 1, width: 2560, height: 1440)
+        let previewPreset = UserAudioPreset(
+            name: "夜间轻震",
+            basePresetRawValue: AudioReactivePreset.balanced.rawValue,
+            drive: 1.85,
+            floor: 0.018,
+            ceiling: 0.16,
+            suppressMusic: true
+        )
+
+        model.devices = [previewDevice]
+        model.selectedDeviceID = previewDevice.id
+        model.displays = [previewDisplay]
+        model.selectedDisplayID = previewDisplay.id
+        model.customAudioPresets = [previewPreset]
+        model.selectedCustomPresetID = previewPreset.id
+        model.audioPreset = .balanced
+        model.audioDrive = previewPreset.drive
+        model.audioFloor = previewPreset.floor
+        model.audioCeiling = previewPreset.ceiling
+        model.audioSuppressMusic = previewPreset.suppressMusic
+        model.lightbarColorPreset = .blue
+        model.batteryStatus = ControllerBatteryStatus(percentage: 72, chargingState: .charging)
+        model.statusLine = "预览模式"
+
+        return model
     }
 }

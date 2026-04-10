@@ -13,10 +13,12 @@ final class DualSenseHIDService {
     private static let bluetoothStatusOffset = 54
 
     private let manager: IOHIDManager
+    private let outputQueue = DispatchQueue(label: "Ds5plus.hid.output.queue", qos: .userInteractive)
     private var knownDevices: [String: IOHIDDevice] = [:]
     private var deviceInfos: [String: DualSenseDeviceInfo] = [:]
     private var deviceStates: [String: DeviceState] = [:]
     private var inputReportBuffers: [String: InputReportBuffer] = [:]
+    private var openedDeviceIDs: Set<String> = []
     private var timer: DispatchSourceTimer?
     private var pulseStopWorkItem: DispatchWorkItem?
     private var currentDeviceID: String?
@@ -31,8 +33,10 @@ final class DualSenseHIDService {
     var onStatsChanged: @Sendable (DriverStats) -> Void = { _ in }
     var onBatteryChanged: @Sendable (String, ControllerBatteryStatus) -> Void = { _, _ in }
 
-    init() {
+    init(startMonitoring: Bool = true) {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
+
+        guard startMonitoring else { return }
 
         let matches: [[String: Any]] = Self.dualSenseProductIDs.map { productID in
             [
@@ -56,9 +60,13 @@ final class DualSenseHIDService {
 
     deinit {
         stopEffect()
-        for device in knownDevices.values {
-            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        outputQueue.sync {}
+        for deviceID in openedDeviceIDs {
+            if let device = knownDevices[deviceID] {
+                IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            }
         }
+        openedDeviceIDs.removeAll()
         IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
     }
 
@@ -82,6 +90,15 @@ final class DualSenseHIDService {
             guard let info = deviceInfo(for: device) else { continue }
             refreshed[info.id] = device
             infos[info.id] = info
+        }
+
+        let removedDeviceIDs = Set(knownDevices.keys).subtracting(refreshed.keys)
+        for deviceID in removedDeviceIDs {
+            let wasCurrentDevice = currentDeviceID == deviceID
+            cleanupDevice(deviceID: deviceID, device: knownDevices[deviceID])
+            if wasCurrentDevice {
+                stopEffect()
+            }
         }
 
         knownDevices = refreshed
@@ -113,16 +130,16 @@ final class DualSenseHIDService {
 
     func sendRealtimeHaptics(leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8) = (0, 96, 255)) {
         guard let currentDeviceID, let device = knownDevices[currentDeviceID] else { return }
-        _ = sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: lightbar)
+        sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: lightbar)
     }
 
     func previewLightbar(deviceID: String, color: (UInt8, UInt8, UInt8)) {
         guard prepareDevice(deviceID: deviceID), let device = knownDevices[deviceID] else { return }
-        _ = sendReport(to: device, deviceID: deviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0), resetLightbar: true)
+        sendReport(to: device, deviceID: deviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0), resetLightbar: true)
         for step in 0 ..< 3 {
             DispatchQueue.main.asyncAfter(deadline: .now() + (.milliseconds(step * 20))) { [weak self] in
                 guard let self else { return }
-                _ = self.sendReport(to: device, deviceID: deviceID, leftMotor: 0, rightMotor: 0, lightbar: color)
+                self.sendReport(to: device, deviceID: deviceID, leftMotor: 0, rightMotor: 0, lightbar: color)
             }
         }
     }
@@ -146,6 +163,36 @@ final class DualSenseHIDService {
         }
     }
 
+    static func batteryStatus(fromBluetoothStatusByte status: UInt8) -> ControllerBatteryStatus {
+        let batteryRaw = Int(status & 0x0F)
+        let chargingBits = Int((status >> 4) & 0x0F)
+
+        let percentage: Int?
+        if batteryRaw <= 9 {
+            percentage = min(max((batteryRaw + 1) * 10, 10), 100)
+        } else if batteryRaw == 10 {
+            percentage = 100
+        } else {
+            percentage = nil
+        }
+
+        let chargingState: BatteryChargingState
+        switch chargingBits {
+        case 0x0:
+            chargingState = .discharging
+        case 0x1:
+            chargingState = .charging
+        case 0x2:
+            chargingState = .full
+        case 0xA, 0xB:
+            chargingState = .notCharging
+        default:
+            chargingState = .unknown
+        }
+
+        return ControllerBatteryStatus(percentage: percentage, chargingState: chargingState)
+    }
+
     func updateEffect(configuration: HapticConfiguration) {
         currentConfiguration = configuration
     }
@@ -156,10 +203,18 @@ final class DualSenseHIDService {
             return false
         }
 
-        let openStatus = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard openStatus == kIOReturnSuccess || openStatus == kIOReturnExclusiveAccess else {
-            log("打开 DualSense 失败: \(openStatus)")
-            return false
+        if !openedDeviceIDs.contains(deviceID) {
+            let openStatus = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            switch openStatus {
+            case kIOReturnSuccess:
+                openedDeviceIDs.insert(deviceID)
+            case kIOReturnExclusiveAccess:
+                log("打开 DualSense 失败：设备正被其他应用独占。请关闭可能占用手柄的游戏、Steam 输入或其他驱动后重试。")
+                return false
+            default:
+                log("打开 DualSense 失败: \(openStatus)")
+                return false
+            }
         }
 
         registerInputReportCallbackIfNeeded(deviceID: deviceID, device: device)
@@ -178,7 +233,7 @@ final class DualSenseHIDService {
         pulseStopWorkItem = nil
 
         if let currentDeviceID, let device = knownDevices[currentDeviceID] {
-            _ = sendReport(to: device, deviceID: currentDeviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0))
+            sendReport(to: device, deviceID: currentDeviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0))
         }
         currentDeviceID = nil
         log("已发送停止报告。")
@@ -190,11 +245,11 @@ final class DualSenseHIDService {
 
         currentDeviceID = deviceID
         currentConfiguration = configuration
-        _ = sendReport(to: device, deviceID: deviceID, leftMotor: configuration.leftMotor, rightMotor: configuration.rightMotor, lightbar: (0, 64, 255))
+        sendReport(to: device, deviceID: deviceID, leftMotor: configuration.leftMotor, rightMotor: configuration.rightMotor, lightbar: (0, 64, 255))
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, let currentDeviceID = self.currentDeviceID, let activeDevice = self.knownDevices[currentDeviceID] else { return }
-            _ = self.sendReport(to: activeDevice, deviceID: currentDeviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0))
+            self.sendReport(to: activeDevice, deviceID: currentDeviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0))
             self.currentDeviceID = nil
             self.log("单次脉冲完成。")
         }
@@ -231,16 +286,16 @@ final class DualSenseHIDService {
             rightMotor = enabled ? currentConfiguration.rightMotor : 0
         }
 
-        _ = sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: (0, 64, 255))
+        sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: (0, 64, 255))
     }
 
-    @discardableResult
-    private func sendReport(to device: IOHIDDevice, deviceID: String, leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8), resetLightbar: Bool = false) -> IOReturn {
+    private func sendReport(to device: IOHIDDevice, deviceID: String, leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8), resetLightbar: Bool = false) {
         let state = deviceStates[deviceID] ?? DeviceState(useVibrationV2: true, updateVersion: nil, firmwareVersion: nil, hardwareVersion: nil)
         sequenceNumber = (sequenceNumber + 1) & 0x0F
+        let sequence = sequenceNumber
 
         let report = DualSenseBluetoothOutputReport(
-            sequence: sequenceNumber,
+            sequence: sequence,
             leftMotor: leftMotor,
             rightMotor: rightMotor,
             useVibrationV2: state.useVibrationV2,
@@ -248,15 +303,23 @@ final class DualSenseHIDService {
             resetLightbar: resetLightbar
         ).bytes
 
-        let result = report.withUnsafeBytes { rawBuffer -> IOReturn in
-            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
-                return kIOReturnBadArgument
+        outputQueue.async {
+            let result = report.withUnsafeBytes { rawBuffer -> IOReturn in
+                guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                    return kIOReturnBadArgument
+                }
+                return IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, CFIndex(report[0]), baseAddress, report.count)
             }
-            return IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, CFIndex(report[0]), baseAddress, report.count)
-        }
 
+            DispatchQueue.main.async { [weak self] in
+                self?.recordReportResult(result, sequence: sequence, leftMotor: leftMotor, rightMotor: rightMotor)
+            }
+        }
+    }
+
+    private func recordReportResult(_ result: IOReturn, sequence: UInt8, leftMotor: UInt8, rightMotor: UInt8) {
         stats.sentReports += 1
-        stats.lastSequence = Int(sequenceNumber)
+        stats.lastSequence = Int(sequence)
         stats.lastLeftMotor = Int(leftMotor)
         stats.lastRightMotor = Int(rightMotor)
         stats.lastResult = result == kIOReturnSuccess ? "ok" : "\(result)"
@@ -265,7 +328,6 @@ final class DualSenseHIDService {
         if result != kIOReturnSuccess {
             log("发送 HID 输出报告失败: \(result)")
         }
-        return result
     }
 
     private func probeState(for device: IOHIDDevice, productID: Int?) -> DeviceState {
@@ -354,6 +416,19 @@ final class DualSenseHIDService {
         onDevicesChanged(devices)
     }
 
+    private func cleanupDevice(deviceID: String, device: IOHIDDevice?) {
+        if openedDeviceIDs.remove(deviceID) != nil, let device {
+            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        deviceStates.removeValue(forKey: deviceID)
+        inputReportBuffers.removeValue(forKey: deviceID)
+        lastPublishedBatteryStatus.removeValue(forKey: deviceID)
+        lastBatteryProcessTime.removeValue(forKey: deviceID)
+        if currentDeviceID == deviceID {
+            currentDeviceID = nil
+        }
+    }
+
     private func log(_ line: String) {
         onLog(line)
     }
@@ -416,34 +491,7 @@ final class DualSenseHIDService {
         }
         lastBatteryProcessTime[info.id] = now
 
-        let status = report[Self.bluetoothStatusOffset]
-        let batteryRaw = Int(status & 0x0F)
-        let chargingBits = Int((status >> 4) & 0x0F)
-
-        let percentage: Int?
-        if batteryRaw <= 9 {
-            percentage = min(max((batteryRaw + 1) * 10, 10), 100)
-        } else if batteryRaw == 10 {
-            percentage = 100
-        } else {
-            percentage = nil
-        }
-
-        let chargingState: BatteryChargingState
-        switch chargingBits {
-        case 0x0:
-            chargingState = .discharging
-        case 0x1:
-            chargingState = .charging
-        case 0x2:
-            chargingState = .full
-        case 0xA, 0xB:
-            chargingState = .notCharging
-        default:
-            chargingState = .unknown
-        }
-
-        let batteryStatus = ControllerBatteryStatus(percentage: percentage, chargingState: chargingState)
+        let batteryStatus = Self.batteryStatus(fromBluetoothStatusByte: report[Self.bluetoothStatusOffset])
         publishBatteryStatus(batteryStatus, for: info.id, force: forcePublish)
     }
 
@@ -469,13 +517,11 @@ final class DualSenseHIDService {
         guard let context else { return }
         let service = Unmanaged<DualSenseHIDService>.fromOpaque(context).takeUnretainedValue()
         guard let info = service.deviceInfo(for: device) else { return }
+        let wasCurrentDevice = service.currentDeviceID == info.id
+        service.cleanupDevice(deviceID: info.id, device: device)
         service.knownDevices.removeValue(forKey: info.id)
         service.deviceInfos.removeValue(forKey: info.id)
-        service.deviceStates.removeValue(forKey: info.id)
-        service.inputReportBuffers.removeValue(forKey: info.id)
-        service.lastPublishedBatteryStatus.removeValue(forKey: info.id)
-        service.lastBatteryProcessTime.removeValue(forKey: info.id)
-        if service.currentDeviceID == info.id {
+        if wasCurrentDevice {
             service.stopEffect()
         }
         service.publishDevices()
@@ -513,7 +559,7 @@ private final class InputReportBuffer {
     }
 }
 
-private struct DualSenseBluetoothOutputReport {
+struct DualSenseBluetoothOutputReport {
     static let reportID: UInt8 = 0x31
     static let tag: UInt8 = 0x10
     static let outputCRCSeedByte: UInt8 = 0xA2

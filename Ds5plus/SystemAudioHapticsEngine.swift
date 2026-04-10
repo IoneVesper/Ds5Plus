@@ -43,7 +43,7 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
         stop()
 
         let content = try await shareableContent()
-        guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else {
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw AudioReactiveError.displayNotFound
         }
 
