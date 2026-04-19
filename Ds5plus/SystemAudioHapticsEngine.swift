@@ -4,10 +4,13 @@ import CoreMedia
 import CoreGraphics
 import QuartzCore
 
-final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate {
+nonisolated final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate, SystemAudioHapticsEngining {
     private let captureQueue = DispatchQueue(label: "Ds5plus.audio.capture.queue")
+    private let stateLock = NSLock()
+    private let semanticAnalyzer = AudioSemanticRealtimeAnalyzer()
     private var stream: SCStream?
     private var isCapturing = false
+    private var didLogSemanticAnalyzerAvailability = false
     private var smoothedRMS: Float = 0
     private var smoothedPeak: Float = 0
     private var smoothedLow: Float = 0
@@ -64,7 +67,7 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
-        self.stream = stream
+        installCurrentStream(stream)
 
         smoothedRMS = 0
         smoothedPeak = 0
@@ -87,6 +90,16 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
         midPassState = 0
         processedFrames = 0
         lastPublishTime = CACurrentMediaTime()
+        semanticAnalyzer.reset()
+
+        if !didLogSemanticAnalyzerAvailability {
+            if semanticAnalyzer.isAvailable {
+                onLog("已启用语义音频模型，将使用模型增强音乐/冲击/移动识别。")
+            } else {
+                onLog("未找到语义音频模型资源，继续使用规则音频识别。")
+            }
+            didLogSemanticAnalyzerAvailability = true
+        }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stream.startCapture { error in
@@ -98,33 +111,77 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
             }
         }
 
-        isCapturing = true
+        guard beginCaptureIfCurrent(stream) else {
+            Task {
+                try? await stream.stopCapture()
+            }
+            throw CancellationError()
+        }
+
         onCaptureStateChanged(true, nil)
         onLog("系统音频捕获已启动。若第一次使用，请确认系统已授予屏幕录制权限。")
     }
 
     func stop() {
-        if let stream {
-            stream.stopCapture { _ in }
-        }
+        let streamToStop: SCStream?
+        let wasCapturing: Bool
+
+        stateLock.lock()
+        streamToStop = stream
         stream = nil
-        if isCapturing {
-            isCapturing = false
+        wasCapturing = isCapturing
+        isCapturing = false
+        stateLock.unlock()
+
+        if let streamToStop {
+            streamToStop.stopCapture { _ in }
+        }
+        semanticAnalyzer.reset()
+        if wasCapturing {
             onCaptureStateChanged(false, nil)
         }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        if isCapturing {
-            isCapturing = false
-            onCaptureStateChanged(false, error.localizedDescription)
-        }
+        guard invalidateCurrentStream(stream) else { return }
+        onCaptureStateChanged(false, error.localizedDescription)
         onLog("系统音频捕获中断：\(error.localizedDescription)")
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard isCurrentStream(stream) else { return }
         guard outputType == .audio else { return }
         processAudioSampleBuffer(sampleBuffer)
+    }
+
+    private func isCurrentStream(_ candidate: SCStream) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stream === candidate
+    }
+
+    private func installCurrentStream(_ candidate: SCStream) {
+        stateLock.lock()
+        stream = candidate
+        stateLock.unlock()
+    }
+
+    private func beginCaptureIfCurrent(_ candidate: SCStream) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard stream === candidate else { return false }
+        isCapturing = true
+        return true
+    }
+
+    private func invalidateCurrentStream(_ candidate: SCStream) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard stream === candidate else { return false }
+        stream = nil
+        let wasCapturing = isCapturing
+        isCapturing = false
+        return wasCapturing
     }
 
     private func processAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
@@ -200,6 +257,8 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
         let midRC: Float = 1 / (2 * .pi * midCutoff)
         let lowAlpha = dt / (lowRC + dt)
         let midAlpha = dt / (midRC + dt)
+        var monoSamples: [Float] = []
+        monoSamples.reserveCapacity(frameCount)
 
         for frame in 0 ..< frameCount {
             var mono: Float = 0
@@ -219,6 +278,7 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
             }
 
             mono /= Float(channels)
+            monoSamples.append(mono)
             let absValue = abs(mono)
             sumSquares += mono * mono
             peak = max(peak, absValue)
@@ -264,13 +324,13 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
         let attack = max(0, attackPeak - (rms * 0.55))
         let lowAttack = max(0, lowAttackPeak - (lowRMS * 0.48))
         let lowCrest = max(0, lowPeak - (lowRMS * 1.10))
-        let effect = (transient * 0.46) +
+        var effect = (transient * 0.46) +
                      (attack * 1.10) +
                      (highDelta * 1.22) +
                      (midDelta * 0.54) +
                      (bodyDelta * 0.14) +
                      (lowDelta * 0.10)
-        let music = max(
+        var music = max(
             0,
             (slowMid * 1.02) +
             (slowLow * 0.48) +
@@ -279,7 +339,7 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
             (attack * 0.82) -
             (transient * 0.46)
         )
-        let movementPulse = max(
+        var movementPulse = max(
             0,
             (lowDelta * 1.20) +
             (lowAttack * 0.92) +
@@ -287,7 +347,25 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
             (transient * 0.12) -
             (music * 0.26)
         )
-        let background = max(0, (music * 0.78) + (slowRMS * 0.24) - (effect * 0.60))
+        var background = max(0, (music * 0.78) + (slowRMS * 0.24) - (effect * 0.60))
+
+        let semanticPrediction = semanticAnalyzer.process(monoSamples: monoSamples, sourceSampleRate: sampleRate)
+        let semanticBlend = blendLegacyAndSemanticChannels(
+            legacyEffect: effect,
+            legacyMusic: music,
+            legacyMovementPulse: movementPulse,
+            legacyBackground: background,
+            transient: transient,
+            attack: attack,
+            lowDelta: lowDelta,
+            slowMid: slowMid,
+            slowRMS: slowRMS,
+            semanticPrediction: semanticPrediction
+        )
+        effect = semanticBlend.effect
+        music = semanticBlend.music
+        movementPulse = semanticBlend.movementPulse
+        background = semanticBlend.background
 
         smoothedTransient = max(transient, smoothedTransient * 0.36)
         smoothedAttack = max(attack, smoothedAttack * 0.28)
@@ -309,6 +387,74 @@ final class SystemAudioHapticsEngine: NSObject, SCStreamOutput, SCStreamDelegate
             music: smoothedMusic,
             background: smoothedBackground,
             framesProcessed: processedFrames
+        )
+    }
+
+    private func blendLegacyAndSemanticChannels(
+        legacyEffect: Float,
+        legacyMusic: Float,
+        legacyMovementPulse: Float,
+        legacyBackground: Float,
+        transient: Float,
+        attack: Float,
+        lowDelta: Float,
+        slowMid: Float,
+        slowRMS: Float,
+        semanticPrediction: AudioSemanticPrediction?
+    ) -> (effect: Float, music: Float, movementPulse: Float, background: Float) {
+        guard let semanticPrediction, semanticPrediction.isAvailable else {
+            return (
+                effect: legacyEffect,
+                music: legacyMusic,
+                movementPulse: legacyMovementPulse,
+                background: legacyBackground
+            )
+        }
+
+        let impactBias = max(
+            semanticPrediction.impactStrength,
+            max(semanticPrediction.dominantImpact * 0.92, semanticPrediction.dominantMixed * 0.55)
+        )
+        let movementBias = max(
+            semanticPrediction.movementStrength,
+            max(semanticPrediction.dominantMovement * 0.92, semanticPrediction.dominantMixed * 0.36)
+        )
+        let musicBias = max(
+            semanticPrediction.musicSuppression,
+            semanticPrediction.dominantMusic * 0.96
+        )
+        let sustainBias = max(
+            semanticPrediction.sustainStrength,
+            max(semanticPrediction.dominantMusic * 0.24, semanticPrediction.dominantMixed * 0.18)
+        )
+        let silenceAttenuation = max(0.25, 1 - (semanticPrediction.dominantSilence * 0.55))
+
+        let semanticEffect = (
+            (legacyEffect * (0.36 + (impactBias * 1.18))) +
+            (transient * (impactBias * 0.24)) +
+            (attack * (impactBias * 0.32))
+        ) * silenceAttenuation
+
+        let semanticMovement = (
+            (legacyMovementPulse * (0.34 + (movementBias * 1.16))) +
+            (lowDelta * (0.06 + (movementBias * 0.24)))
+        ) * silenceAttenuation
+
+        let semanticMusic = (
+            (legacyMusic * (0.32 + (musicBias * 1.06))) +
+            (slowMid * (0.12 + (musicBias * 0.20)))
+        ) * max(0.22, 1 - (semanticPrediction.dominantSilence * 0.30))
+
+        let semanticBackground = max(
+            legacyBackground * (0.38 + (sustainBias * 0.86)),
+            (slowRMS * (0.06 + (sustainBias * 0.20))) + (musicBias * 0.01)
+        )
+
+        return (
+            effect: min(max(semanticEffect, 0), 0.35),
+            music: min(max(semanticMusic, 0), 0.35),
+            movementPulse: min(max(semanticMovement, 0), 0.26),
+            background: min(max(semanticBackground, 0), 0.30)
         )
     }
 

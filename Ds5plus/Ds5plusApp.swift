@@ -2,9 +2,17 @@ import SwiftUI
 
 @main
 struct Ds5plusApp: App {
-    @StateObject private var model = AppViewModel()
+    @StateObject private var model: AppViewModel
     @StateObject private var languageManager = LanguageManager.shared
     @State private var showAboutSheet = false
+
+    init() {
+        let launchEnvironment = ProcessInfo.processInfo.environment
+        let shouldBootstrapServices =
+            launchEnvironment["XCTestConfigurationFilePath"] == nil &&
+            launchEnvironment["DS5PLUS_DISABLE_BOOTSTRAP"] != "1"
+        _model = StateObject(wrappedValue: AppViewModel(autoBootstrap: shouldBootstrapServices))
+    }
 
     var body: some Scene {
         WindowGroup {

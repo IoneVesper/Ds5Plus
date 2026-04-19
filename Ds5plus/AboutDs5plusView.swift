@@ -81,9 +81,16 @@ struct AboutDs5plusView: View {
             Text(title)
                 .foregroundStyle(.secondary)
             Spacer()
-            Link(value, destination: URL(string: value)!)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if let url = URL(string: value) {
+                Link(value, destination: url)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            } else {
+                Text(value)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
         }
         .font(.subheadline)
     }

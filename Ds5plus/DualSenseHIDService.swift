@@ -1,8 +1,8 @@
 import Foundation
-import IOKit.hid
+@preconcurrency import IOKit.hid
 import QuartzCore
 
-final class DualSenseHIDService {
+nonisolated final class DualSenseHIDService: @unchecked Sendable, DualSenseHIDServicing {
     private static let sonyVendorID = 0x054C
     private static let dualSenseProductIDs: Set<Int> = [0x0CE6, 0x0DF2]
     private static let firmwareInfoReportID: CFIndex = 0x20
@@ -11,9 +11,11 @@ final class DualSenseHIDService {
     private static let bluetoothInputReportID: UInt8 = 0x31
     private static let bluetoothInputReportSize = 78
     private static let bluetoothStatusOffset = 54
+    private static let statsPublishInterval: CFTimeInterval = 0.20
 
     private let manager: IOHIDManager
     private let outputQueue = DispatchQueue(label: "Ds5plus.hid.output.queue", qos: .userInteractive)
+    private let realtimeTargetLock = NSLock()
     private var knownDevices: [String: IOHIDDevice] = [:]
     private var deviceInfos: [String: DualSenseDeviceInfo] = [:]
     private var deviceStates: [String: DeviceState] = [:]
@@ -25,8 +27,13 @@ final class DualSenseHIDService {
     private var currentConfiguration = HapticConfiguration()
     private var sequenceNumber: UInt8 = 0
     private var stats = DriverStats()
+    private var lastPublishedStats = DriverStats()
+    private var lastStatsPublishTime: CFTimeInterval = 0
     private var lastPublishedBatteryStatus: [String: ControllerBatteryStatus] = [:]
     private var lastBatteryProcessTime: [String: CFTimeInterval] = [:]
+    private var realtimeGeneration: UInt64 = 0
+    private var realtimeTarget: RealtimeTarget?
+    private var monitoringStarted = false
 
     var onDevicesChanged: @Sendable ([DualSenseDeviceInfo]) -> Void = { _ in }
     var onLog: @Sendable (String) -> Void = { _ in }
@@ -36,26 +43,9 @@ final class DualSenseHIDService {
     init(startMonitoring: Bool = true) {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(0))
 
-        guard startMonitoring else { return }
-
-        let matches: [[String: Any]] = Self.dualSenseProductIDs.map { productID in
-            [
-                kIOHIDVendorIDKey: Self.sonyVendorID,
-                kIOHIDProductIDKey: productID,
-                kIOHIDTransportKey: "Bluetooth"
-            ]
+        if startMonitoring {
+            refreshDevicesSnapshot()
         }
-        IOHIDManagerSetDeviceMatchingMultiple(manager, matches as CFArray)
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, Self.deviceMatched, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
-        IOHIDManagerRegisterDeviceRemovalCallback(manager, Self.deviceRemoved, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        let status = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        if status == kIOReturnSuccess {
-            log("HID 管理器已启动，等待蓝牙 DualSense 接入。")
-        } else {
-            log("HID 管理器启动失败: \(status)")
-        }
-        refreshDevicesSnapshot()
     }
 
     deinit {
@@ -71,6 +61,8 @@ final class DualSenseHIDService {
     }
 
     func refreshDevicesSnapshot() {
+        startMonitoringIfNeeded()
+
         guard let deviceSet = IOHIDManagerCopyDevices(manager) else {
             publishDevices()
             return
@@ -122,15 +114,26 @@ final class DualSenseHIDService {
     @discardableResult
     func startRealtimeControl(deviceID: String) -> Bool {
         stopEffect()
-        guard prepareDevice(deviceID: deviceID) else { return false }
+        guard prepareDevice(deviceID: deviceID),
+              let device = knownDevices[deviceID] else { return false }
         currentDeviceID = deviceID
+        let useVibrationV2 = deviceStates[deviceID]?.useVibrationV2 ?? true
+        setRealtimeTarget(deviceID: deviceID, device: device, useVibrationV2: useVibrationV2)
         log("已开始音频驱动模式: \(deviceInfos[deviceID]?.displayName ?? deviceID)")
         return true
     }
 
     func sendRealtimeHaptics(leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8) = (0, 96, 255)) {
-        guard let currentDeviceID, let device = knownDevices[currentDeviceID] else { return }
-        sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: lightbar)
+        guard let target = snapshotRealtimeTarget() else { return }
+        sendReport(
+            to: target.device,
+            deviceID: target.deviceID,
+            leftMotor: leftMotor,
+            rightMotor: rightMotor,
+            lightbar: lightbar,
+            useVibrationV2: target.useVibrationV2,
+            expectedRealtimeGeneration: target.generation
+        )
     }
 
     func previewLightbar(deviceID: String, color: (UInt8, UInt8, UInt8)) {
@@ -198,6 +201,10 @@ final class DualSenseHIDService {
     }
 
     private func prepareDevice(deviceID: String) -> Bool {
+        if knownDevices[deviceID] == nil {
+            refreshDevicesSnapshot()
+        }
+
         guard let device = knownDevices[deviceID] else {
             log("未找到目标 DualSense 设备。")
             return false
@@ -226,14 +233,46 @@ final class DualSenseHIDService {
         return true
     }
 
+    private func startMonitoringIfNeeded() {
+        guard !monitoringStarted else { return }
+
+        let matches: [[String: Any]] = Self.dualSenseProductIDs.map { productID in
+            [
+                kIOHIDVendorIDKey: Self.sonyVendorID,
+                kIOHIDProductIDKey: productID,
+                kIOHIDTransportKey: "Bluetooth"
+            ]
+        }
+        IOHIDManagerSetDeviceMatchingMultiple(manager, matches as CFArray)
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, Self.deviceMatched, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, Self.deviceRemoved, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        let status = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        monitoringStarted = true
+
+        if status == kIOReturnSuccess {
+            log("HID 管理器已启动，等待蓝牙 DualSense 接入。")
+        } else {
+            log("HID 管理器启动失败: \(status)")
+        }
+    }
+
     func stopEffect() {
         timer?.cancel()
         timer = nil
         pulseStopWorkItem?.cancel()
         pulseStopWorkItem = nil
+        clearRealtimeTarget()
 
         if let currentDeviceID, let device = knownDevices[currentDeviceID] {
-            sendReport(to: device, deviceID: currentDeviceID, leftMotor: 0, rightMotor: 0, lightbar: (0, 0, 0))
+            sendReport(
+                to: device,
+                deviceID: currentDeviceID,
+                leftMotor: 0,
+                rightMotor: 0,
+                lightbar: (0, 0, 0),
+                useVibrationV2: deviceStates[currentDeviceID]?.useVibrationV2 ?? true
+            )
         }
         currentDeviceID = nil
         log("已发送停止报告。")
@@ -289,21 +328,37 @@ final class DualSenseHIDService {
         sendReport(to: device, deviceID: currentDeviceID, leftMotor: leftMotor, rightMotor: rightMotor, lightbar: (0, 64, 255))
     }
 
-    private func sendReport(to device: IOHIDDevice, deviceID: String, leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8), resetLightbar: Bool = false) {
-        let state = deviceStates[deviceID] ?? DeviceState(useVibrationV2: true, updateVersion: nil, firmwareVersion: nil, hardwareVersion: nil)
-        sequenceNumber = (sequenceNumber + 1) & 0x0F
-        let sequence = sequenceNumber
+    private func sendReport(
+        to device: IOHIDDevice,
+        deviceID: String,
+        leftMotor: UInt8,
+        rightMotor: UInt8,
+        lightbar: (UInt8, UInt8, UInt8),
+        resetLightbar: Bool = false,
+        useVibrationV2: Bool? = nil,
+        expectedRealtimeGeneration: UInt64? = nil
+    ) {
+        let resolvedUseVibrationV2 = useVibrationV2 ?? (deviceStates[deviceID]?.useVibrationV2 ?? true)
 
-        let report = DualSenseBluetoothOutputReport(
-            sequence: sequence,
-            leftMotor: leftMotor,
-            rightMotor: rightMotor,
-            useVibrationV2: state.useVibrationV2,
-            lightbar: lightbar,
-            resetLightbar: resetLightbar
-        ).bytes
+        outputQueue.async { [weak self] in
+            guard let self else { return }
+            if let expectedRealtimeGeneration,
+               !self.isRealtimeGenerationCurrent(expectedRealtimeGeneration) {
+                return
+            }
 
-        outputQueue.async {
+            self.sequenceNumber = (self.sequenceNumber + 1) & 0x0F
+            let sequence = self.sequenceNumber
+
+            let report = DualSenseBluetoothOutputReport(
+                sequence: sequence,
+                leftMotor: leftMotor,
+                rightMotor: rightMotor,
+                useVibrationV2: resolvedUseVibrationV2,
+                lightbar: lightbar,
+                resetLightbar: resetLightbar
+            ).bytes
+
             let result = report.withUnsafeBytes { rawBuffer -> IOReturn in
                 guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
                     return kIOReturnBadArgument
@@ -311,9 +366,7 @@ final class DualSenseHIDService {
                 return IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, CFIndex(report[0]), baseAddress, report.count)
             }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.recordReportResult(result, sequence: sequence, leftMotor: leftMotor, rightMotor: rightMotor)
-            }
+            self.recordReportResult(result, sequence: sequence, leftMotor: leftMotor, rightMotor: rightMotor)
         }
     }
 
@@ -323,7 +376,19 @@ final class DualSenseHIDService {
         stats.lastLeftMotor = Int(leftMotor)
         stats.lastRightMotor = Int(rightMotor)
         stats.lastResult = result == kIOReturnSuccess ? "ok" : "\(result)"
-        onStatsChanged(stats)
+
+        let now = CACurrentMediaTime()
+        let resultChanged = stats.lastResult != lastPublishedStats.lastResult
+        let shouldPublish =
+            lastStatsPublishTime == 0 ||
+            resultChanged ||
+            (now - lastStatsPublishTime) >= Self.statsPublishInterval
+
+        if shouldPublish {
+            lastStatsPublishTime = now
+            lastPublishedStats = stats
+            onStatsChanged(stats)
+        }
 
         if result != kIOReturnSuccess {
             log("发送 HID 输出报告失败: \(result)")
@@ -426,7 +491,39 @@ final class DualSenseHIDService {
         lastBatteryProcessTime.removeValue(forKey: deviceID)
         if currentDeviceID == deviceID {
             currentDeviceID = nil
+            clearRealtimeTarget()
         }
+    }
+
+    private func setRealtimeTarget(deviceID: String, device: IOHIDDevice, useVibrationV2: Bool) {
+        realtimeTargetLock.lock()
+        realtimeGeneration &+= 1
+        realtimeTarget = RealtimeTarget(
+            deviceID: deviceID,
+            device: device,
+            useVibrationV2: useVibrationV2,
+            generation: realtimeGeneration
+        )
+        realtimeTargetLock.unlock()
+    }
+
+    private func clearRealtimeTarget() {
+        realtimeTargetLock.lock()
+        realtimeGeneration &+= 1
+        realtimeTarget = nil
+        realtimeTargetLock.unlock()
+    }
+
+    private func snapshotRealtimeTarget() -> RealtimeTarget? {
+        realtimeTargetLock.lock()
+        defer { realtimeTargetLock.unlock() }
+        return realtimeTarget
+    }
+
+    private func isRealtimeGenerationCurrent(_ generation: UInt64) -> Bool {
+        realtimeTargetLock.lock()
+        defer { realtimeTargetLock.unlock() }
+        return realtimeTarget?.generation == generation
     }
 
     private func log(_ line: String) {
@@ -537,14 +634,14 @@ final class DualSenseHIDService {
     }
 }
 
-private struct DeviceState {
+nonisolated private struct DeviceState {
     let useVibrationV2: Bool
     let updateVersion: UInt16?
     let firmwareVersion: UInt32?
     let hardwareVersion: UInt32?
 }
 
-private final class InputReportBuffer {
+nonisolated private final class InputReportBuffer {
     let pointer: UnsafeMutablePointer<UInt8>
     let length: CFIndex
 
@@ -559,7 +656,7 @@ private final class InputReportBuffer {
     }
 }
 
-struct DualSenseBluetoothOutputReport {
+nonisolated struct DualSenseBluetoothOutputReport {
     static let reportID: UInt8 = 0x31
     static let tag: UInt8 = 0x10
     static let outputCRCSeedByte: UInt8 = 0xA2
@@ -656,4 +753,11 @@ struct DualSenseBluetoothOutputReport {
         }
         return crc
     }
+}
+
+nonisolated private struct RealtimeTarget {
+    let deviceID: String
+    let device: IOHIDDevice
+    let useVibrationV2: Bool
+    let generation: UInt64
 }

@@ -20,6 +20,7 @@ final class Ds5plusUITestsLaunchTests: XCTestCase {
     @MainActor
     func testLaunch() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["DS5PLUS_DISABLE_BOOTSTRAP"] = "1"
         app.launch()
 
         // Insert steps here to perform after app launch but before taking a screenshot,

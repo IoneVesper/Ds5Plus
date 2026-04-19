@@ -1,7 +1,7 @@
 import Foundation
 import CoreGraphics
 
-struct DualSenseDeviceInfo: Identifiable, Hashable, Sendable {
+nonisolated struct DualSenseDeviceInfo: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let serialNumber: String?
@@ -16,7 +16,7 @@ struct DualSenseDeviceInfo: Identifiable, Hashable, Sendable {
     }
 }
 
-struct CaptureDisplay: Identifiable, Hashable, Sendable {
+nonisolated struct CaptureDisplay: Identifiable, Hashable, Sendable {
     let id: CGDirectDisplayID
     let width: Int
     let height: Int
@@ -26,7 +26,7 @@ struct CaptureDisplay: Identifiable, Hashable, Sendable {
     }
 }
 
-enum BatteryChargingState: Sendable, Equatable {
+nonisolated enum BatteryChargingState: Sendable, Equatable {
     case discharging
     case charging
     case full
@@ -34,12 +34,12 @@ enum BatteryChargingState: Sendable, Equatable {
     case unknown
 }
 
-struct ControllerBatteryStatus: Sendable, Equatable {
+nonisolated struct ControllerBatteryStatus: Sendable, Equatable {
     var percentage: Int?
     var chargingState: BatteryChargingState = .unknown
 }
 
-enum ControlMode: String, CaseIterable, Identifiable {
+nonisolated enum ControlMode: String, CaseIterable, Identifiable {
     case manual
     case audioReactive
 
@@ -62,7 +62,7 @@ enum ControlMode: String, CaseIterable, Identifiable {
     }
 }
 
-enum HapticMode: String, CaseIterable, Identifiable {
+nonisolated enum HapticMode: String, CaseIterable, Identifiable {
     case constant
     case pulse
 
@@ -85,14 +85,14 @@ enum HapticMode: String, CaseIterable, Identifiable {
     }
 }
 
-struct HapticConfiguration: Sendable {
+nonisolated struct HapticConfiguration: Sendable {
     var mode: HapticMode = .constant
     var leftMotor: UInt8 = 160
     var rightMotor: UInt8 = 80
     var pulseFrequency: Double = 6
 }
 
-struct AudioReactiveSample: Sendable {
+nonisolated struct AudioReactiveSample: Sendable {
     var rms: Float = 0
     var peak: Float = 0
     var lowFrequency: Float = 0
@@ -106,13 +106,13 @@ struct AudioReactiveSample: Sendable {
     var framesProcessed: Int = 0
 }
 
-struct AudioReactiveTuning: Sendable {
+nonisolated struct AudioReactiveTuning: Sendable {
     var drive: Double
     var floor: Double
     var ceiling: Double
 }
 
-struct AudioReactiveProfile: Sendable {
+nonisolated struct AudioReactiveProfile: Sendable {
     var leftLow: Float
     var leftBody: Float
     var leftTransient: Float
@@ -122,7 +122,7 @@ struct AudioReactiveProfile: Sendable {
     var responseCurve: Float
 }
 
-struct AudioReactiveDetectionProfile: Sendable {
+nonisolated struct AudioReactiveDetectionProfile: Sendable {
     var musicSuppressionStrength: Float
     var sustainSuppressionStrength: Float
     var movementTriggerThreshold: Float
@@ -149,7 +149,7 @@ struct AudioReactiveDetectionProfile: Sendable {
     var burstRightMix: Float
 }
 
-struct UserAudioPreset: Identifiable, Codable, Hashable, Sendable {
+nonisolated struct UserAudioPreset: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
     var name: String
     var basePresetRawValue: String
@@ -594,7 +594,7 @@ enum LightbarColorPreset: String, CaseIterable, Identifiable {
     }
 }
 
-enum LogFileSizeOption: Int, CaseIterable, Identifiable {
+nonisolated enum LogFileSizeOption: Int, CaseIterable, Identifiable {
     case mb20 = 20
     case mb50 = 50
     case mb100 = 100
@@ -610,7 +610,7 @@ enum LogFileSizeOption: Int, CaseIterable, Identifiable {
     }
 }
 
-struct DriverStats: Sendable {
+nonisolated struct DriverStats: Sendable {
     var sentReports: Int = 0
     var lastSequence: Int = 0
     var lastLeftMotor: Int = 0

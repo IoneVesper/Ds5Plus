@@ -3,9 +3,35 @@ import Combine
 import AppKit
 import QuartzCore
 
+nonisolated protocol DualSenseHIDServicing: AnyObject {
+    var onDevicesChanged: @Sendable ([DualSenseDeviceInfo]) -> Void { get set }
+    var onLog: @Sendable (String) -> Void { get set }
+    var onStatsChanged: @Sendable (DriverStats) -> Void { get set }
+    var onBatteryChanged: @Sendable (String, ControllerBatteryStatus) -> Void { get set }
+
+    func refreshDevicesSnapshot()
+    func refreshBatteryStatus(deviceID: String)
+    func startRealtimeControl(deviceID: String) -> Bool
+    func sendRealtimeHaptics(leftMotor: UInt8, rightMotor: UInt8, lightbar: (UInt8, UInt8, UInt8))
+    func previewLightbar(deviceID: String, color: (UInt8, UInt8, UInt8))
+    func stopEffect()
+}
+
+nonisolated protocol SystemAudioHapticsEngining: AnyObject {
+    var onLog: @Sendable (String) -> Void { get set }
+    var onSample: @Sendable (AudioReactiveSample) -> Void { get set }
+    var onCaptureStateChanged: @Sendable (Bool, String?) -> Void { get set }
+
+    func refreshDisplays() async throws -> [CaptureDisplay]
+    func start(displayID: CGDirectDisplayID) async throws
+    func stop()
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     private let shouldBootstrapServices: Bool
+    private let realtimePipeline = AudioReactiveRealtimePipeline()
+    private var suppressRuntimeTargetRebind = false
 
     @Published var devices: [DualSenseDeviceInfo] = []
     @Published var selectedDeviceID: String? {
@@ -15,24 +41,50 @@ final class AppViewModel: ObservableObject {
             if shouldBootstrapServices, let selectedDeviceID {
                 hidService.refreshBatteryStatus(deviceID: selectedDeviceID)
             }
+            handleRuntimeTargetSelectionChangeIfNeeded()
         }
     }
     @Published var displays: [CaptureDisplay] = []
-    @Published var selectedDisplayID: CGDirectDisplayID?
+    @Published var selectedDisplayID: CGDirectDisplayID? {
+        didSet {
+            guard selectedDisplayID != oldValue else { return }
+            handleRuntimeTargetSelectionChangeIfNeeded()
+        }
+    }
 
-    @Published var audioPreset: AudioReactivePreset = .balanced
+    @Published var audioPreset: AudioReactivePreset = .balanced {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
     @Published var customAudioPresets: [UserAudioPreset] = []
     @Published var selectedCustomPresetID: UUID?
-    @Published var audioDrive: Double = 2.2
-    @Published var audioFloor: Double = 0.015
-    @Published var audioCeiling: Double = 0.14
-    @Published var audioSuppressMusic = true
+    @Published var audioDrive: Double = 2.2 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var audioFloor: Double = 0.015 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var audioCeiling: Double = 0.14 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var audioSuppressMusic = true {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
     @Published var audioSample = AudioReactiveSample()
-    @Published var lightbarColorPreset: LightbarColorPreset = .blue
-    @Published var isCustomLightbarColorSelected = false
-    @Published var customLightbarHue: Double = 0.61
-    @Published var customLightbarSaturation: Double = 0.75
-    @Published var customLightbarBrightness: Double = 0.98
+    @Published var lightbarColorPreset: LightbarColorPreset = .blue {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var isCustomLightbarColorSelected = false {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var customLightbarHue: Double = 0.61 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var customLightbarSaturation: Double = 0.75 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
+    @Published var customLightbarBrightness: Double = 0.98 {
+        didSet { syncRealtimePipelineConfiguration() }
+    }
     @Published var logFileSizeOption: LogFileSizeOption = .mb50
     @Published var batteryStatus = ControllerBatteryStatus()
 
@@ -43,23 +95,12 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var logFileURL: URL
     @Published private(set) var logFileSizeBytes: Int64 = 0
 
-    private let hidService: DualSenseHIDService
-    private let audioEngine: SystemAudioHapticsEngine
+    private let hidService: any DualSenseHIDServicing
+    private let audioEngine: any SystemAudioHapticsEngining
     private let userDefaults: UserDefaults
 
     private var audioStartTask: Task<Void, Never>?
     private var runGeneration = 0
-    private var previousMovementSignal: Float = 0
-    private var previousImpactSignal: Float = 0
-    private var suppressionMemory: Float = 0
-    private var sustainLeftState: Float = 0
-    private var sustainRightState: Float = 0
-    private var tickEnvelope: Float = 0
-    private var pulseEnvelope: Float = 0
-    private var burstEnvelope: Float = 0
-    private var lastTickTriggerTime: CFTimeInterval = 0
-    private var lastPulseTriggerTime: CFTimeInterval = 0
-    private var lastBurstTriggerTime: CFTimeInterval = 0
 
     private enum DefaultsKeys {
         static let customAudioPresets = "Ds5plus.customAudioPresets"
@@ -72,13 +113,13 @@ final class AppViewModel: ObservableObject {
     }
 
     init(
-        hidService: DualSenseHIDService? = nil,
-        audioEngine: SystemAudioHapticsEngine? = nil,
+        hidService: (any DualSenseHIDServicing)? = nil,
+        audioEngine: (any SystemAudioHapticsEngining)? = nil,
         userDefaults: UserDefaults = .standard,
         autoBootstrap: Bool = true
     ) {
         shouldBootstrapServices = autoBootstrap
-        self.hidService = hidService ?? DualSenseHIDService(startMonitoring: autoBootstrap)
+        self.hidService = hidService ?? DualSenseHIDService(startMonitoring: false)
         self.audioEngine = audioEngine ?? SystemAudioHapticsEngine()
         self.userDefaults = userDefaults
         logFileURL = autoBootstrap ? AppViewModel.prepareLogFile() : AppViewModel.previewLogFileURL()
@@ -99,7 +140,9 @@ final class AppViewModel: ObservableObject {
                         return
                     }
 
-                    self.selectedDeviceID = devices.first?.id
+                    self.withSuppressedRuntimeTargetRebind {
+                        self.selectedDeviceID = devices.first?.id
+                    }
                     self.batteryStatus = ControllerBatteryStatus()
                     self.statusLine = devices.isEmpty ? "未发现蓝牙 DualSense" : "已连接蓝牙 DualSense"
 
@@ -141,14 +184,15 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            self.audioEngine.onSample = { [weak self] sample in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.audioSample = sample
-                    guard self.isRunning else { return }
-                    let motors = self.mapAudioSampleToMotors(sample)
-                    let color = self.mapAudioSampleToLightbar(sample)
-                    self.hidService.sendRealtimeHaptics(leftMotor: motors.left, rightMotor: motors.right, lightbar: color)
+            let realtimePipeline = self.realtimePipeline
+            let hidService = self.hidService
+            self.audioEngine.onSample = { sample in
+                if let output = realtimePipeline.process(sample) {
+                    hidService.sendRealtimeHaptics(
+                        leftMotor: output.leftMotor,
+                        rightMotor: output.rightMotor,
+                        lightbar: output.lightbar
+                    )
                 }
             }
 
@@ -169,11 +213,12 @@ final class AppViewModel: ObservableObject {
 
         applyAudioPreset(audioPreset, shouldLog: false)
         refreshLogFileMetadata()
+        syncRealtimePipelineConfiguration()
         if autoBootstrap {
             trimLogFileIfNeeded()
             appendLog("应用已启动。")
-            Task {
-                await refreshAll(silent: true)
+            Task { [weak self] in
+                await self?.refreshAll(silent: true)
             }
         }
     }
@@ -339,20 +384,32 @@ final class AppViewModel: ObservableObject {
                     return
                 }
 
-                self.selectedDisplayID = nil
+                withSuppressedRuntimeTargetRebind {
+                    self.selectedDisplayID = nil
+                }
+                if isRunning || isStarting {
+                    stopAudioReactive(
+                        statusLine: "捕获源不可用",
+                        logLine: "当前捕获显示器已不可用，已自动停止输出。"
+                    )
+                }
                 if !silent {
                     appendLog(displays.isEmpty ? "当前没有可用的系统音频捕获源。" : "当前捕获显示器已不可用，请重新选择。")
                 }
                 return
             }
 
-            self.selectedDisplayID = displays.first?.id
+            withSuppressedRuntimeTargetRebind {
+                self.selectedDisplayID = displays.first?.id
+            }
             if !silent {
                 appendLog(displays.isEmpty ? "当前没有可用的系统音频捕获源。" : "已刷新系统音频捕获源。")
             }
         } catch {
             self.displays = []
-            self.selectedDisplayID = nil
+            withSuppressedRuntimeTargetRebind {
+                self.selectedDisplayID = nil
+            }
             appendLog("读取系统音频捕获显示器失败：\(error.localizedDescription)")
         }
     }
@@ -389,7 +446,7 @@ final class AppViewModel: ObservableObject {
         let requestedDeviceID = selectedDeviceID
         let requestedDisplayID = selectedDisplayID
 
-        resetHapticMixer()
+        realtimePipeline.deactivate()
         isStarting = true
         isRunning = false
         statusLine = "音频驱动启动中"
@@ -405,48 +462,43 @@ final class AppViewModel: ObservableObject {
             do {
                 try await audioEngine.start(displayID: requestedDisplayID)
                 try Task.checkCancellation()
-                await MainActor.run {
-                    guard self.runGeneration == generation,
-                          self.selectedDeviceID == requestedDeviceID,
-                          self.selectedDisplayID == requestedDisplayID else {
-                        self.audioStartTask = nil
-                        self.audioEngine.stop()
-                        self.hidService.stopEffect()
-                        self.resetHapticMixer()
-                        self.isStarting = false
-                        self.isRunning = false
-                        self.statusLine = "启动已取消"
-                        return
-                    }
+                guard self.runGeneration == generation,
+                      self.selectedDeviceID == requestedDeviceID,
+                      self.selectedDisplayID == requestedDisplayID else {
                     self.audioStartTask = nil
+                    self.audioEngine.stop()
+                    self.hidService.stopEffect()
+                    self.realtimePipeline.deactivate()
                     self.isStarting = false
-                    self.isRunning = true
-                    self.statusLine = "音频驱动运行中"
-                    self.appendLog("音频驱动已开始。")
+                    self.isRunning = false
+                    self.statusLine = "启动已取消"
+                    return
                 }
+                self.realtimePipeline.activate()
+                self.audioStartTask = nil
+                self.isStarting = false
+                self.isRunning = true
+                self.statusLine = "音频驱动运行中"
+                self.appendLog("音频驱动已开始。")
             } catch is CancellationError {
-                await MainActor.run {
-                    guard self.runGeneration == generation else { return }
-                    self.audioStartTask = nil
-                    self.audioEngine.stop()
-                    self.hidService.stopEffect()
-                    self.resetHapticMixer()
-                    self.isStarting = false
-                    self.isRunning = false
-                    self.statusLine = "音频驱动已停止"
-                }
+                guard self.runGeneration == generation else { return }
+                self.audioStartTask = nil
+                self.audioEngine.stop()
+                self.hidService.stopEffect()
+                self.realtimePipeline.deactivate()
+                self.isStarting = false
+                self.isRunning = false
+                self.statusLine = "音频驱动已停止"
             } catch {
-                await MainActor.run {
-                    guard self.runGeneration == generation else { return }
-                    self.audioStartTask = nil
-                    self.audioEngine.stop()
-                    self.hidService.stopEffect()
-                    self.resetHapticMixer()
-                    self.isStarting = false
-                    self.isRunning = false
-                    self.statusLine = "启动失败"
-                    self.appendLog("启动音频驱动模式失败：\(error.localizedDescription)")
-                }
+                guard self.runGeneration == generation else { return }
+                self.audioStartTask = nil
+                self.audioEngine.stop()
+                self.hidService.stopEffect()
+                self.realtimePipeline.deactivate()
+                self.isStarting = false
+                self.isRunning = false
+                self.statusLine = "启动失败"
+                self.appendLog("启动音频驱动模式失败：\(error.localizedDescription)")
             }
         }
     }
@@ -464,7 +516,7 @@ final class AppViewModel: ObservableObject {
         audioStartTask = nil
         audioEngine.stop()
         hidService.stopEffect()
-        resetHapticMixer()
+        realtimePipeline.deactivate()
         self.statusLine = statusLine
         isStarting = false
         isRunning = false
@@ -480,7 +532,7 @@ final class AppViewModel: ObservableObject {
         audioDrive = tuning.drive
         audioFloor = tuning.floor
         audioCeiling = tuning.ceiling
-        resetHapticMixer()
+        syncRealtimePipelineConfiguration(resetMixer: true)
         if shouldLog {
             appendLog("已切换音频预设：\(preset.title)")
         }
@@ -493,7 +545,7 @@ final class AppViewModel: ObservableObject {
         audioFloor = preset.floor
         audioCeiling = preset.ceiling
         audioSuppressMusic = preset.suppressMusic
-        resetHapticMixer()
+        syncRealtimePipelineConfiguration(resetMixer: true)
         if shouldLog {
             appendLog("已切换自定义预设：\(preset.name)")
         }
@@ -514,7 +566,7 @@ final class AppViewModel: ObservableObject {
             audioCeiling = tuning.ceiling
             appendLog("已恢复 \(audioPreset.title) 默认参数")
         }
-        resetHapticMixer()
+        syncRealtimePipelineConfiguration(resetMixer: true)
     }
 
     func saveCustomAudioPreset(named name: String) {
@@ -630,12 +682,329 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func mapAudioSampleToMotors(_ sample: AudioReactiveSample) -> (left: UInt8, right: UInt8) {
-        let floor = Float(audioFloor)
-        let ceiling = max(Float(audioCeiling), floor + 0.001)
-        let gain = Float(audioDrive)
-        let profile = audioPreset.profile
-        let detection = audioPreset.detectionProfile
+    private func syncRealtimePipelineConfiguration(resetMixer: Bool = false) {
+        let configuration = AudioReactiveRealtimePipelineConfiguration(
+            drive: Float(audioDrive),
+            floor: Float(audioFloor),
+            ceiling: Float(audioCeiling),
+            suppressMusic: audioSuppressMusic,
+            profile: audioPreset.profile,
+            detection: audioPreset.detectionProfile,
+            lightbarAccent: currentLightbarAccentRGB()
+        )
+        realtimePipeline.updateConfiguration(configuration, resetMixer: resetMixer)
+    }
+
+    private func withSuppressedRuntimeTargetRebind<Result>(_ body: () -> Result) -> Result {
+        let previousValue = suppressRuntimeTargetRebind
+        suppressRuntimeTargetRebind = true
+        defer { suppressRuntimeTargetRebind = previousValue }
+        return body()
+    }
+
+    private func handleRuntimeTargetSelectionChangeIfNeeded() {
+        guard shouldBootstrapServices else { return }
+        guard !suppressRuntimeTargetRebind else { return }
+        guard isRunning || isStarting else { return }
+
+        if selectedDeviceID == nil || selectedDisplayID == nil {
+            stopAudioReactive(
+                statusLine: "音频驱动已停止",
+                logLine: "运行目标已变更，已停止输出。"
+            )
+            return
+        }
+
+        stopAudioReactive(
+            statusLine: "重新绑定中",
+            logLine: "运行目标已变更，正在重新绑定。"
+        )
+        startAudioReactive()
+    }
+
+    private func currentLightbarPreviewColor() -> (UInt8, UInt8, UInt8) {
+        let accent = currentLightbarAccentRGB()
+        return (
+            UInt8(clamping: Int((accent.0 * 255).rounded())),
+            UInt8(clamping: Int((accent.1 * 255).rounded())),
+            UInt8(clamping: Int((accent.2 * 255).rounded()))
+        )
+    }
+
+    private func currentLightbarAccentRGB() -> (Double, Double, Double) {
+        if isCustomLightbarColorSelected {
+            let color = NSColor(
+                calibratedHue: CGFloat(customLightbarHue),
+                saturation: CGFloat(customLightbarSaturation),
+                brightness: CGFloat(customLightbarBrightness),
+                alpha: 1
+            ).usingColorSpace(.deviceRGB) ?? .systemBlue
+
+            return (
+                Double(color.redComponent),
+                Double(color.greenComponent),
+                Double(color.blueComponent)
+            )
+        }
+
+        return lightbarColorPreset.rgb
+    }
+
+    private func persistCustomLightbarSettings() {
+        guard shouldBootstrapServices else { return }
+        userDefaults.set(isCustomLightbarColorSelected, forKey: DefaultsKeys.customLightbarSelected)
+        userDefaults.set(customLightbarHue, forKey: DefaultsKeys.customLightbarHue)
+        userDefaults.set(customLightbarSaturation, forKey: DefaultsKeys.customLightbarSaturation)
+        userDefaults.set(customLightbarBrightness, forKey: DefaultsKeys.customLightbarBrightness)
+    }
+
+    private func persistCustomAudioPresets() {
+        guard shouldBootstrapServices else { return }
+        guard let data = try? JSONEncoder().encode(customAudioPresets) else { return }
+        userDefaults.set(data, forKey: DefaultsKeys.customAudioPresets)
+    }
+
+    private func uniqueCustomPresetName(from baseName: String) -> String {
+        let existingNames = Set(customAudioPresets.map(\.name))
+        guard existingNames.contains(baseName) else { return baseName }
+
+        var suffix = 2
+        while existingNames.contains("\(baseName) \(suffix)") {
+            suffix += 1
+        }
+        return "\(baseName) \(suffix)"
+    }
+
+    private func appendLog(_ line: String) {
+        let timestamp = Date.now.formatted(date: .omitted, time: .standard)
+        let entry = "[\(timestamp)] \(line)\n"
+
+        guard let data = entry.data(using: .utf8) else { return }
+
+        if let handle = try? FileHandle(forWritingTo: logFileURL) {
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+                logFileSizeBytes += Int64(data.count)
+            } catch {
+                try? handle.close()
+                refreshLogFileMetadata()
+            }
+        } else {
+            try? data.write(to: logFileURL, options: .atomic)
+            refreshLogFileMetadata()
+        }
+
+        trimLogFileIfNeeded()
+    }
+
+    private func trimLogFileIfNeeded() {
+        let limit = logFileSizeOption.bytes
+        guard logFileSizeBytes > Int64(limit) else { return }
+        guard let data = try? Data(contentsOf: logFileURL) else {
+            refreshLogFileMetadata()
+            return
+        }
+        guard data.count > limit else {
+            logFileSizeBytes = Int64(data.count)
+            return
+        }
+        let trimmed = Self.trimmedLogDataPreservingUTF8(data, limit: limit)
+        try? Data(trimmed).write(to: logFileURL, options: .atomic)
+        logFileSizeBytes = Int64(trimmed.count)
+    }
+
+    static func trimmedLogDataPreservingUTF8(_ data: Data, limit: Int) -> Data {
+        guard data.count > limit else { return data }
+
+        let retainCount = Int(Double(limit) * 0.40)
+        let targetLength = max(retainCount, min(limit, 512 * 1024))
+        var startIndex = max(0, data.count - targetLength)
+
+        while startIndex < data.count, isUTF8ContinuationByte(data[data.index(data.startIndex, offsetBy: startIndex)]) {
+            startIndex += 1
+        }
+
+        if startIndex >= data.count {
+            return Data()
+        }
+
+        let alignedStart = data.index(data.startIndex, offsetBy: startIndex)
+        return Data(data.suffix(from: alignedStart))
+    }
+
+    private static func isUTF8ContinuationByte(_ byte: UInt8) -> Bool {
+        (byte & 0b1100_0000) == 0b1000_0000
+    }
+
+    private static func prepareLogFile() -> URL {
+        let fileManager = FileManager.default
+        let baseDirectory = (try? fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        let directory = baseDirectory.appendingPathComponent("Ds5plus/Logs", isDirectory: true)
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let fileURL = directory.appendingPathComponent("runtime.log")
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            fileManager.createFile(atPath: fileURL.path, contents: Data())
+        }
+        return fileURL
+    }
+
+    private static func previewLogFileURL() -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("Ds5plus-preview.log")
+    }
+}
+
+extension AppViewModel {
+    static var preview: AppViewModel {
+        let model = AppViewModel(autoBootstrap: false)
+
+        let previewDevice = DualSenseDeviceInfo(
+            id: "preview-dualsense",
+            name: "DualSense Wireless Controller",
+            serialNumber: "AA:BB:CC:DD:EE:FF",
+            transport: "Bluetooth",
+            productID: 0x0CE6
+        )
+        let previewDisplay = CaptureDisplay(id: 1, width: 2560, height: 1440)
+        let previewPreset = UserAudioPreset(
+            name: "夜间轻震",
+            basePresetRawValue: AudioReactivePreset.balanced.rawValue,
+            drive: 1.85,
+            floor: 0.018,
+            ceiling: 0.16,
+            suppressMusic: true
+        )
+
+        model.devices = [previewDevice]
+        model.selectedDeviceID = previewDevice.id
+        model.displays = [previewDisplay]
+        model.selectedDisplayID = previewDisplay.id
+        model.customAudioPresets = [previewPreset]
+        model.selectedCustomPresetID = previewPreset.id
+        model.audioPreset = .balanced
+        model.audioDrive = previewPreset.drive
+        model.audioFloor = previewPreset.floor
+        model.audioCeiling = previewPreset.ceiling
+        model.audioSuppressMusic = previewPreset.suppressMusic
+        model.lightbarColorPreset = .blue
+        model.batteryStatus = ControllerBatteryStatus(percentage: 72, chargingState: .charging)
+        model.statusLine = "预览模式"
+
+        return model
+    }
+}
+
+nonisolated private struct AudioReactiveRealtimePipelineConfiguration: Sendable {
+    let drive: Float
+    let floor: Float
+    let ceiling: Float
+    let suppressMusic: Bool
+    let profile: AudioReactiveProfile
+    let detection: AudioReactiveDetectionProfile
+    let lightbarAccent: (Double, Double, Double)
+}
+
+nonisolated private struct AudioReactiveRealtimePipelineOutput: Sendable {
+    let leftMotor: UInt8
+    let rightMotor: UInt8
+    let lightbar: (UInt8, UInt8, UInt8)
+}
+
+nonisolated private final class AudioReactiveRealtimePipeline: @unchecked Sendable {
+    private let lock = NSLock()
+    private var configuration = AudioReactiveRealtimePipelineConfiguration(
+        drive: 2.2,
+        floor: 0.015,
+        ceiling: 0.14,
+        suppressMusic: true,
+        profile: AudioReactiveProfile(
+            leftLow: 0.74,
+            leftBody: 0.22,
+            leftTransient: 0.04,
+            rightLow: 0.08,
+            rightBody: 0.54,
+            rightTransient: 0.38,
+            responseCurve: 0.92
+        ),
+        detection: AudioReactiveDetectionProfile(
+            musicSuppressionStrength: 1.06,
+            sustainSuppressionStrength: 0.94,
+            movementTriggerThreshold: 0.08,
+            movementCooldown: 0.07,
+            impactTriggerThreshold: 0.11,
+            burstTriggerThreshold: 0.22,
+            lowBandMusicPenalty: 0.26,
+            midBandMusicPenalty: 0.18,
+            musicDecay: 0.86,
+            movementRecoveryGain: 0.42,
+            backgroundGate: 0.035,
+            sustainLeftCap: 0.20,
+            sustainRightCap: 0.16,
+            sustainLeftBias: 1.0,
+            sustainRightBias: 1.0,
+            tickStrengthCap: 0.52,
+            pulseStrengthCap: 0.66,
+            burstStrengthCap: 0.92,
+            tickLeftMix: 0.18,
+            tickRightMix: 0.05,
+            pulseLeftMix: 0.09,
+            pulseRightMix: 0.24,
+            burstLeftMix: 0.14,
+            burstRightMix: 0.34
+        ),
+        lightbarAccent: (0.24, 0.48, 0.98)
+    )
+    private var isActive = false
+    private var previousMovementSignal: Float = 0
+    private var previousImpactSignal: Float = 0
+    private var suppressionMemory: Float = 0
+    private var sustainLeftState: Float = 0
+    private var sustainRightState: Float = 0
+    private var tickEnvelope: Float = 0
+    private var pulseEnvelope: Float = 0
+    private var burstEnvelope: Float = 0
+    private var lastTickTriggerTime: CFTimeInterval = 0
+    private var lastPulseTriggerTime: CFTimeInterval = 0
+    private var lastBurstTriggerTime: CFTimeInterval = 0
+
+    func updateConfiguration(_ configuration: AudioReactiveRealtimePipelineConfiguration, resetMixer: Bool = false) {
+        lock.lock()
+        self.configuration = configuration
+        if resetMixer {
+            resetLocked()
+        }
+        lock.unlock()
+    }
+
+    func activate() {
+        lock.lock()
+        resetLocked()
+        isActive = true
+        lock.unlock()
+    }
+
+    func deactivate() {
+        lock.lock()
+        isActive = false
+        resetLocked()
+        lock.unlock()
+    }
+
+    func process(_ sample: AudioReactiveSample) -> AudioReactiveRealtimePipelineOutput? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard isActive else { return nil }
+
+        let floor = configuration.floor
+        let ceiling = max(configuration.ceiling, floor + 0.001)
+        let gain = configuration.drive
+        let profile = configuration.profile
+        let detection = configuration.detection
         let now = CACurrentMediaTime()
 
         func normalize(_ value: Float) -> Float {
@@ -664,9 +1033,9 @@ final class AppViewModel: ObservableObject {
             (low * detection.lowBandMusicPenalty) +
             (mid * detection.midBandMusicPenalty)
 
-        let rawSuppression = audioSuppressMusic ? min(max(rawMusicDominance - (foreground * 0.56), 0), 1) : 0
+        let rawSuppression = configuration.suppressMusic ? min(max(rawMusicDominance - (foreground * 0.56), 0), 1) : 0
         suppressionMemory = max(rawSuppression, suppressionMemory * detection.musicDecay)
-        let suppression = audioSuppressMusic ? suppressionMemory : 0
+        let suppression = configuration.suppressMusic ? suppressionMemory : 0
 
         let lowForeground = max(low - (suppression * detection.lowBandMusicPenalty * 0.32), 0)
         let bodyForeground = max(body - (suppression * detection.midBandMusicPenalty * 0.18), 0)
@@ -778,7 +1147,10 @@ final class AppViewModel: ObservableObject {
             1
         )
 
-        if sustainGate < detection.backgroundGate, tickEnvelope < 0.015, pulseEnvelope < 0.015, burstEnvelope < 0.015 {
+        if sustainGate < detection.backgroundGate,
+           tickEnvelope < 0.015,
+           pulseEnvelope < 0.015,
+           burstEnvelope < 0.015 {
             sustainLeftState *= 0.80
             sustainRightState *= 0.76
         }
@@ -786,13 +1158,25 @@ final class AppViewModel: ObservableObject {
         let leftMotor = UInt8(clamping: Int((leftValue * 255).rounded()))
         let rightMotor = UInt8(clamping: Int((rightValue * 255).rounded()))
 
-        if leftMotor < 8 && rightMotor < 8 {
-            return (0, 0)
-        }
-        return (leftMotor, rightMotor)
+        let activitySource = max(sample.effect * 1.18, max(sample.transient * 1.22, sample.attack * 1.34))
+        let activity = min(max(activitySource * configuration.drive * 1.8, 0), 1)
+        let brightness = 0.34 + (Double(activity) * 0.66)
+        let red = min(max(configuration.lightbarAccent.0 * brightness, 0), 1)
+        let green = min(max(configuration.lightbarAccent.1 * brightness, 0), 1)
+        let blue = min(max(configuration.lightbarAccent.2 * brightness, 0), 1)
+
+        return AudioReactiveRealtimePipelineOutput(
+            leftMotor: leftMotor < 8 && rightMotor < 8 ? 0 : leftMotor,
+            rightMotor: leftMotor < 8 && rightMotor < 8 ? 0 : rightMotor,
+            lightbar: (
+                UInt8(clamping: Int((red * 255).rounded())),
+                UInt8(clamping: Int((green * 255).rounded())),
+                UInt8(clamping: Int((blue * 255).rounded()))
+            )
+        )
     }
 
-    private func resetHapticMixer() {
+    private func resetLocked() {
         previousMovementSignal = 0
         previousImpactSignal = 0
         suppressionMemory = 0
@@ -804,173 +1188,5 @@ final class AppViewModel: ObservableObject {
         lastTickTriggerTime = 0
         lastPulseTriggerTime = 0
         lastBurstTriggerTime = 0
-    }
-
-    private func mapAudioSampleToLightbar(_ sample: AudioReactiveSample) -> (UInt8, UInt8, UInt8) {
-        let accent = currentLightbarAccentRGB()
-        let activitySource = max(sample.effect * 1.18, max(sample.transient * 1.22, sample.attack * 1.34))
-        let activity = min(max(activitySource * Float(audioDrive) * 1.8, 0), 1)
-        let brightness = 0.34 + (Double(activity) * 0.66)
-        let red = min(max(accent.0 * brightness, 0), 1)
-        let green = min(max(accent.1 * brightness, 0), 1)
-        let blue = min(max(accent.2 * brightness, 0), 1)
-        return (
-            UInt8(clamping: Int((red * 255).rounded())),
-            UInt8(clamping: Int((green * 255).rounded())),
-            UInt8(clamping: Int((blue * 255).rounded()))
-        )
-    }
-
-    private func currentLightbarPreviewColor() -> (UInt8, UInt8, UInt8) {
-        let accent = currentLightbarAccentRGB()
-        return (
-            UInt8(clamping: Int((accent.0 * 255).rounded())),
-            UInt8(clamping: Int((accent.1 * 255).rounded())),
-            UInt8(clamping: Int((accent.2 * 255).rounded()))
-        )
-    }
-
-    private func currentLightbarAccentRGB() -> (Double, Double, Double) {
-        if isCustomLightbarColorSelected {
-            let color = NSColor(
-                calibratedHue: CGFloat(customLightbarHue),
-                saturation: CGFloat(customLightbarSaturation),
-                brightness: CGFloat(customLightbarBrightness),
-                alpha: 1
-            ).usingColorSpace(.deviceRGB) ?? .systemBlue
-
-            return (
-                Double(color.redComponent),
-                Double(color.greenComponent),
-                Double(color.blueComponent)
-            )
-        }
-
-        return lightbarColorPreset.rgb
-    }
-
-    private func persistCustomLightbarSettings() {
-        guard shouldBootstrapServices else { return }
-        userDefaults.set(isCustomLightbarColorSelected, forKey: DefaultsKeys.customLightbarSelected)
-        userDefaults.set(customLightbarHue, forKey: DefaultsKeys.customLightbarHue)
-        userDefaults.set(customLightbarSaturation, forKey: DefaultsKeys.customLightbarSaturation)
-        userDefaults.set(customLightbarBrightness, forKey: DefaultsKeys.customLightbarBrightness)
-    }
-
-    private func persistCustomAudioPresets() {
-        guard shouldBootstrapServices else { return }
-        guard let data = try? JSONEncoder().encode(customAudioPresets) else { return }
-        userDefaults.set(data, forKey: DefaultsKeys.customAudioPresets)
-    }
-
-    private func uniqueCustomPresetName(from baseName: String) -> String {
-        let existingNames = Set(customAudioPresets.map(\.name))
-        guard existingNames.contains(baseName) else { return baseName }
-
-        var suffix = 2
-        while existingNames.contains("\(baseName) \(suffix)") {
-            suffix += 1
-        }
-        return "\(baseName) \(suffix)"
-    }
-
-    private func appendLog(_ line: String) {
-        let timestamp = Date.now.formatted(date: .omitted, time: .standard)
-        let entry = "[\(timestamp)] \(line)\n"
-
-        guard let data = entry.data(using: .utf8) else { return }
-
-        if let handle = try? FileHandle(forWritingTo: logFileURL) {
-            do {
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-                try handle.close()
-                logFileSizeBytes += Int64(data.count)
-            } catch {
-                try? handle.close()
-                refreshLogFileMetadata()
-            }
-        } else {
-            try? data.write(to: logFileURL, options: .atomic)
-            refreshLogFileMetadata()
-        }
-
-        trimLogFileIfNeeded()
-    }
-
-    private func trimLogFileIfNeeded() {
-        let limit = logFileSizeOption.bytes
-        guard logFileSizeBytes > Int64(limit) else { return }
-        guard let data = try? Data(contentsOf: logFileURL) else {
-            refreshLogFileMetadata()
-            return
-        }
-        guard data.count > limit else {
-            logFileSizeBytes = Int64(data.count)
-            return
-        }
-        let retainCount = Int(Double(limit) * 0.40)
-        let trimmed = data.suffix(max(retainCount, min(limit, 512 * 1024)))
-        try? Data(trimmed).write(to: logFileURL, options: .atomic)
-        logFileSizeBytes = Int64(trimmed.count)
-    }
-
-    private static func prepareLogFile() -> URL {
-        let fileManager = FileManager.default
-        let baseDirectory = (try? fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-        let directory = baseDirectory.appendingPathComponent("Ds5plus/Logs", isDirectory: true)
-        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        let fileURL = directory.appendingPathComponent("runtime.log")
-        if !fileManager.fileExists(atPath: fileURL.path) {
-            fileManager.createFile(atPath: fileURL.path, contents: Data())
-        }
-        return fileURL
-    }
-
-    private static func previewLogFileURL() -> URL {
-        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("Ds5plus-preview.log")
-    }
-}
-
-extension AppViewModel {
-    static var preview: AppViewModel {
-        let model = AppViewModel(autoBootstrap: false)
-
-        let previewDevice = DualSenseDeviceInfo(
-            id: "preview-dualsense",
-            name: "DualSense Wireless Controller",
-            serialNumber: "AA:BB:CC:DD:EE:FF",
-            transport: "Bluetooth",
-            productID: 0x0CE6
-        )
-        let previewDisplay = CaptureDisplay(id: 1, width: 2560, height: 1440)
-        let previewPreset = UserAudioPreset(
-            name: "夜间轻震",
-            basePresetRawValue: AudioReactivePreset.balanced.rawValue,
-            drive: 1.85,
-            floor: 0.018,
-            ceiling: 0.16,
-            suppressMusic: true
-        )
-
-        model.devices = [previewDevice]
-        model.selectedDeviceID = previewDevice.id
-        model.displays = [previewDisplay]
-        model.selectedDisplayID = previewDisplay.id
-        model.customAudioPresets = [previewPreset]
-        model.selectedCustomPresetID = previewPreset.id
-        model.audioPreset = .balanced
-        model.audioDrive = previewPreset.drive
-        model.audioFloor = previewPreset.floor
-        model.audioCeiling = previewPreset.ceiling
-        model.audioSuppressMusic = previewPreset.suppressMusic
-        model.lightbarColorPreset = .blue
-        model.batteryStatus = ControllerBatteryStatus(percentage: 72, chargingState: .charging)
-        model.statusLine = "预览模式"
-
-        return model
     }
 }
